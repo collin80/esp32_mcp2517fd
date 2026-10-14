@@ -2,10 +2,15 @@
 #define MCP2517_h
 
 #include "Arduino.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "esp32_mcp2517fd_defines.h"
 #include <can_common.h>
 
 //#define DEBUG_SETUP
+//Lets applications detect the stat* counters and getCachedDiag1() at compile time
+#define MCP2517FD_HAS_STATS 1
+
 #define FD_RX_BUFFER_SIZE	64
 #define FD_TX_BUFFER_SIZE  32
 #define FD_NUM_FILTERS 32
@@ -90,9 +95,33 @@ class MCP2517FD : public CAN_COMMON
     bool needTXFIFOReset = false;
     bool inFDMode;
 
+    //Serialises multi-step access to the chip between the polling task, the reset watcher and user calls
+    //(init, filters, mode changes). Recursive because e.g. resetHardware() calls initFD().
+    void lockChip();
+    void unlockChip();
+
+    //Diagnostic counters since start-up. Protocol errors are counted here instead of resetting the chip.
+    //Each counter has one writer (the polling task; the reset watcher for statResets; the sending task for
+    //statTxQueueFull); readers just print.
+    uint32_t statBusErrors = 0;    //CERRIF: error counter state changes (warning/passive/bus-off)
+    uint32_t statInvalidMsgs = 0;  //IVMIF: invalid message (form/stuff/CRC/bit error) seen
+    uint32_t statRxOverflows = 0;  //RX FIFO overflowed, frames were lost in hardware
+    uint32_t statTxErrors = 0;     //TXERR seen on the transmit queue (frame is retried)
+    uint32_t statTxDropped = 0;    //TXATIF: retransmission attempts used up, frame dropped
+    uint32_t statResets = 0;       //hardware re-inits done by the reset watcher
+    uint32_t statRxFrames = 0;     //frames read out of the RX FIFO
+    uint32_t statRxQueueFull = 0;  //received frames dropped because the RX/callback queue was full (app too slow)
+    uint32_t statTxQueueFull = 0;  //frames dropped by sendFrame()/sendFrameFD() because the TX queue was full
+    uint32_t statTxLoaded = 0;     //frames loaded into the controller's transmit queue
+    uint32_t statTxRearms = 0;     //times the transmit queue had frames waiting but TXREQ had been cleared
+    uint32_t getCachedDiag1() { return cachedDiag1; } //BDIAG1 error flag bits seen since the last init
+
   private:
+	int _InitLocked(uint32_t CAN_Bus_Speed, uint8_t Freq, uint8_t SJW);
+	uint32_t _initFDLocked(uint32_t nominalRate, uint32_t dataRate);
 	bool _init(uint32_t baud, uint8_t freq, uint8_t sjw, bool autoBaud);
 	bool _initFD(uint32_t nominalSpeed, uint32_t dataSpeed, uint8_t freq, uint8_t sjw, bool autoBaud);
+	SemaphoreHandle_t chipMutex = NULL;
 	void initSPI();
 	void commonInit();	
     void handleFrameDispatch(CAN_FRAME_FD &frame, int filterHit);
